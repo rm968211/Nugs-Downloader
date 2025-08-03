@@ -93,3 +93,5 @@ Options:
 
 # Building
 Build command is `go build main.go structs.go`
+
+linux build command is `CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o bin/app .`
