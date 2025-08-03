@@ -60,12 +60,14 @@ var regexStrings = [11]string{
 	`^https://play.nugs.net/library/playlist/(\d+)$`,
 	`(^https://2nu.gs/[a-zA-Z\d]+$)`,
 	`^https://play.nugs.net/#/videos/artist/\d+/.+/(\d+)$`,
-	`^https://play.nugs.net/artist/(\d+)(?:/albums|/latest|)$`,
+	// fixed: avoid non-capturing groups; keep only one relevant capture (artist ID)
+	`^https://play.nugs.net/artist/(\d+)(/albums|/latest)?$`,
 	`^https://play.nugs.net/livestream/(\d+)/exclusive$`,
 	`^https://play.nugs.net/watch/livestreams/exclusive/(\d+)$`,
 	`^https://play.nugs.net/#/my-webcasts/\d+-(\d+)-\d+-\d+$`,
-	`^https://www.nugs.net/on/demandware.store/Sites-NugsNet-Site/d`+
-		`efault/(?:Stash-QueueVideo|NugsVideo-GetStashVideo)\?([a-zA-Z0-9=%&-]+$)`,
+	// fixed: remove (?:...), capture only the query string as the single important group
+	`^https://www.nugs.net/on/demandware.store/Sites-NugsNet-Site/d` +
+		`efault/(Stash-QueueVideo|NugsVideo-GetStashVideo)\?(.+)$`,
 	`^https://play.nugs.net/library/webcast/(\d+)$`,
 }
 
@@ -73,12 +75,12 @@ var qualityMap = map[string]Quality{
 	".alac16/": {Specs: "16-bit / 44.1 kHz ALAC", Extension: ".m4a", Format: 1},
 	".flac16/": {Specs: "16-bit / 44.1 kHz FLAC", Extension: ".flac", Format: 2},
 	// .mqa24/ must be above .flac?
-	".mqa24/":  {Specs: "24-bit / 48 kHz MQA", Extension: ".flac", Format: 3},
-	".flac?": {Specs: "FLAC", Extension: ".flac", Format: 2},
-	".s360/":   {Specs: "360 Reality Audio", Extension: ".mp4", Format: 4},
+	".mqa24/": {Specs: "24-bit / 48 kHz MQA", Extension: ".flac", Format: 3},
+	".flac?":  {Specs: "FLAC", Extension: ".flac", Format: 2},
+	".s360/":  {Specs: "360 Reality Audio", Extension: ".mp4", Format: 4},
 	".aac150/": {Specs: "150 Kbps AAC", Extension: ".m4a", Format: 5},
-	".m4a?": {Specs: "AAC", Extension: ".m4a", Format: 5},
-	".m3u8?":	{Extension: ".m4a", Format: 6},
+	".m4a?":   {Specs: "AAC", Extension: ".m4a", Format: 5},
+	".m3u8?":  {Extension: ".m4a", Format: 6},
 }
 
 var resolveRes = map[int]string{
@@ -343,6 +345,38 @@ func getUserInfo(token string) (string, error) {
 	return obj.Sub, nil
 }
 
+// Improved diagnostics: read the body for clearer errors if response isn't JSON.
+func getAlbumMeta(albumId string) (*AlbumMeta, error) {
+	req, err := http.NewRequest(http.MethodGet, streamApiBase+"api.aspx", nil)
+	if err != nil {
+		return nil, err
+	}
+	q := url.Values{}
+	q.Set("method", "catalog.container")
+	q.Set("containerID", albumId)
+	q.Set("vdisp", "1")
+	req.URL.RawQuery = q.Encode()
+	req.Header.Add("User-Agent", userAgent)
+
+	do, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer do.Body.Close()
+
+	body, _ := io.ReadAll(do.Body)
+	if do.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s: %s", do.Status, string(body[:min(512, len(body))]))
+	}
+
+	var obj AlbumMeta
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return nil, fmt.Errorf("decode catalog.container failed: %v\nFirst 512 bytes: %s",
+			err, string(body[:min(512, len(body))]))
+	}
+	return &obj, nil
+}
+
 func getSubInfo(token string) (*SubInfo, error) {
 	req, err := http.NewRequest(http.MethodGet, subInfoUrl, nil)
 	if err != nil {
@@ -404,7 +438,18 @@ func checkUrl(_url string) (string, int) {
 		regex := regexp.MustCompile(regexStr)
 		match := regex.FindStringSubmatch(_url)
 		if match != nil {
-			return match[1], i
+			// Prefer the first purely-numeric capture (IDs). If none, use the last non-empty capture.
+			digits := regexp.MustCompile(`^\d+$`)
+			for gi := 1; gi < len(match); gi++ {
+				if digits.MatchString(match[gi]) {
+					return match[gi], i
+				}
+			}
+			for gi := len(match) - 1; gi >= 1; gi-- {
+				if match[gi] != "" {
+					return match[gi], i
+				}
+			}
 		}
 	}
 	return "", 0
@@ -422,33 +467,6 @@ func extractLegToken(tokenStr string) (string, string, error) {
 		return "", "", err
 	}
 	return obj.LegacyToken, obj.LegacyUguid, nil
-}
-
-func getAlbumMeta(albumId string) (*AlbumMeta, error) {
-	req, err := http.NewRequest(http.MethodGet, streamApiBase+"api.aspx", nil)
-	if err != nil {
-		return nil, err
-	}
-	query := url.Values{}
-	query.Set("method", "catalog.container")
-	query.Set("containerID", albumId)
-	query.Set("vdisp", "1")
-	req.URL.RawQuery = query.Encode()
-	req.Header.Add("User-Agent", userAgent)
-	do, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer do.Body.Close()
-	if do.StatusCode != http.StatusOK {
-		return nil, errors.New(do.Status)
-	}
-	var obj AlbumMeta
-	err = json.NewDecoder(do.Body).Decode(&obj)
-	if err != nil {
-		return nil, err
-	}
-	return &obj, nil
 }
 
 func getPlistMeta(plistId, email, legacyToken string, cat bool) (*PlistMeta, error) {
@@ -690,6 +708,7 @@ func parseHlsMaster(qual *Quality) error {
 	qual.URL = manBase + variantUri + q
 	return nil
 }
+
 func getKey(keyUrl string) ([]byte, error) {
 	req, err := client.Get(keyUrl)
 	if err != nil {
@@ -714,7 +733,7 @@ func getKey(keyUrl string) ([]byte, error) {
 // 	if err != nil {
 // 		return err
 // 	}
-
+//
 // 	block, err := aes.NewCipher([]byte(key))
 // 	if err != nil {
 // 		in_f.Close()
@@ -774,7 +793,6 @@ func tsToAac(decData []byte, outPath, ffmpegNameStr string) error {
 	}
 	return nil
 }
-
 
 func hlsOnly(trackPath, manUrl, ffmpegNameStr string) error {
 	req, err := client.Get(manUrl)
@@ -854,13 +872,8 @@ func processTrack(folPath string, trackNum, trackTotal int, cfg *Config, track *
 		if quality == nil {
 			fmt.Println("The API returned an unsupported format, URL:", streamUrl)
 			continue
-			//return errors.New("The API returned an unsupported format.")
 		}
 		quals = append(quals, quality)
-		// if quality.Format == 6 {
-		// 	isHlsOnly = true
-		// 	break
-		// }
 	}
 
 	if len(quals) == 0 {
@@ -1198,9 +1211,9 @@ func downloadVideo(videoPath, _url string) error {
 
 	totalBytes := do.ContentLength
 	counter := &WriteCounter{
-		Total:     totalBytes,
-		TotalStr:  humanize.Bytes(uint64(totalBytes)),
-		StartTime: time.Now().UnixMilli(),
+		Total:      totalBytes,
+		TotalStr:   humanize.Bytes(uint64(totalBytes)),
+		StartTime:  time.Now().UnixMilli(),
 		Downloaded: startByte,
 	}
 	_, err = io.Copy(f, io.TeeReader(do.Body, counter))
@@ -1304,7 +1317,6 @@ func getNextChapStart(chapters []interface{}, idx int) float64 {
 	}
 	return 0
 }
-
 
 func writeChapsFile(chapters []interface{}, dur int) error {
 	f, err := os.OpenFile(chapsFileFname, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
@@ -1421,11 +1433,11 @@ func parseLstreamMeta(_meta *ArtistMeta) *AlbumMeta {
 
 func video(videoID, uguID string, cfg *Config, streamParams *StreamParams, _meta *AlbArtResp, isLstream bool) error {
 	var (
-		chapsAvail bool
-		skuID int
+		chapsAvail  bool
+		skuID       int
 		manifestUrl string
-		meta *AlbArtResp
-		err error
+		meta        *AlbArtResp
+		err         error
 	)
 
 	if _meta != nil {
@@ -1442,7 +1454,7 @@ func video(videoID, uguID string, cfg *Config, streamParams *StreamParams, _meta
 	if !cfg.SkipChapters {
 		chapsAvail = !reflect.ValueOf(meta.VideoChapters).IsZero()
 	}
-	
+
 	videoFname := meta.ArtistName + " - " + strings.TrimRight(meta.ContainerInfo, " ")
 	fmt.Println(videoFname)
 	if len(videoFname) > 110 {
@@ -1458,6 +1470,7 @@ func video(videoID, uguID string, cfg *Config, streamParams *StreamParams, _meta
 	if skuID == 0 {
 		return errors.New("no video available")
 	}
+
 	if uguID == "" {
 		manifestUrl, err = getStreamMeta(
 			meta.ContainerID, skuID, 0, streamParams)
@@ -1583,17 +1596,51 @@ func catalogPlist(_plistId, legacyToken string, cfg *Config, streamParams *Strea
 	return err
 }
 
+// FIX: handle purchased webcast URLs by using skuID directly when present.
+// This avoids getAlbumMeta() and its HTML error pages.
 func paidLstream(query, uguID string, cfg *Config, streamParams *StreamParams) error {
-    q, err := url.ParseQuery(query)
+	q, err := url.ParseQuery(query)
 	if err != nil {
 		return err
 	}
-	showId := q["showID"][0]
-	if showId == "" {
-		return errors.New("url didn't contain a show id parameter")
+
+	// showID is required
+	showVals, ok := q["showID"]
+	if !ok || len(showVals) == 0 || showVals[0] == "" {
+		return errors.New("url didn't contain a showID parameter")
 	}
-	err = video(showId, uguID, cfg, streamParams, nil, true)
-	return err
+	showID := showVals[0]
+
+	// skuID is strongly preferred for purchased videos
+	var skuID int
+	if v := q.Get("skuID"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			skuID = n
+		}
+	}
+
+	// Optional fields for nicer filenames (already URL-decoded by ParseQuery)
+	artistName := q.Get("artistName")
+	perfDate := q.Get("perfDate") // e.g., 08-01-2025
+	location := q.Get("location") // e.g., "8-1-2025 Golden Gate Park San Francisco, CA"
+
+	// If we have the skuID, we can avoid the catalog call entirely.
+	if skuID != 0 {
+		// Minimal meta to drive naming and SKU lookup
+		meta := &AlbArtResp{
+			ArtistName:    artistName,
+			ContainerInfo: strings.TrimSpace(strings.Join([]string{perfDate, location}, " ")),
+			// Seed a product format list so getLstreamSku finds our skuID
+			ProductFormatList: []*ProductFormatList{
+				{FormatStr: "LIVE HD VIDEO", SkuID: skuID},
+			},
+		}
+		// This path will call getPurchasedManUrl(skuID, showID, ...) inside video()
+		return video(showID, uguID, cfg, streamParams, meta, true)
+	}
+
+	// Fallback (no skuID in URL): keep previous behavior, which may call catalog.
+	return video(showID, uguID, cfg, streamParams, nil, true)
 }
 
 func init() {
@@ -1604,6 +1651,13 @@ func init() {
 |_|___|___|_  |___|  |____/|___|_____|_|_|_|___|__,|___|___|_|  
 	  |___|
 `)
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func main() {
