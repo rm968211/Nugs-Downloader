@@ -90,3 +90,6 @@ Options:
 - I will not be responsible for how you use Nugs Downloader.    
 - Nugs brand and name is the registered trademark of its respective owner.    
 - Nugs Downloader has no partnership, sponsorship or endorsement with Nugs.
+
+# Building
+Build command is `go build main.go structs.go`
